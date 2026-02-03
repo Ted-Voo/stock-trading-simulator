@@ -11,4 +11,10 @@ media/
 node_modules/
 
 # OS
-.DS_StoreS
+.DS_Store
+
+# Logs
+*.log 
+
+# VS Code Settings
+.vscode/
