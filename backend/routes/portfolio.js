@@ -1,9 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 const User = require('../models/User');
 const Portfolio = require('../models/Portfolio');
 const Transaction = require('../models/Transaction');
+require('dotenv').config();
 
 // Middleware to verify JWT
 const authMiddleware = async (req, res, next) => {
@@ -19,52 +21,70 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
-// Mock stock prices
-const mockStockPrices = {
-  AAPL: 150,
-  TSLA: 800,
-  MSFT: 300
-};
+// Fetch live stock price from Finnhub
+async function getStockPrice(symbol) {
+  try {
+    const response = await axios.get('https://finnhub.io/api/v1/quote', {
+      params: {
+        symbol,
+        token: process.env.STOCK_API_KEY
+      }
+    });
+    const price = response.data.c; // current price
+    if (!price) throw new Error('Price not available');
+    return price;
+  } catch (err) {
+    console.error(`Error fetching price for ${symbol}:`, err.message);
+    return null;
+  }
+}
 
-// Get portfolio + balance
+// Get portfolio + balance + optional live prices
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    // Get user's portfolio
-    let portfolio = await Portfolio.findOne({ userId: req.user });
-    if (!portfolio) portfolio = { stocks: [] }; // default empty portfolio
-
-    // Get user's balance
     const user = await User.findById(req.user);
+    let portfolio = await Portfolio.findOne({ userId: req.user });
+    if (!portfolio) portfolio = { stocks: [] };
+
+    // Add live price and unrealized P/L for each stock
+    const portfolioWithLive = await Promise.all(
+      portfolio.stocks.map(async (stock) => {
+        const livePrice = await getStockPrice(stock.symbol);
+        return {
+          symbol: stock.symbol,
+          quantity: stock.quantity,
+          avgPrice: stock.avgPrice,
+          currentPrice: livePrice,
+          unrealizedPL: livePrice ? (livePrice - stock.avgPrice) * stock.quantity : null
+        };
+      })
+    );
 
     res.json({
       balance: user.balance,
-      portfolio: portfolio.stocks
+      portfolio: portfolioWithLive
     });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }
 });
 
-
 // Buy stock
 router.post('/buy', authMiddleware, async (req, res) => {
   const { symbol, quantity } = req.body;
-  if (!mockStockPrices[symbol]) return res.status(400).json({ msg: 'Invalid stock symbol' });
-  if (quantity <= 0) return res.status(400).json({ msg: 'Quantity must be positive' });
+  if (!symbol || quantity <= 0) return res.status(400).json({ msg: 'Invalid symbol or quantity' });
 
   try {
-    const pricePerShare = mockStockPrices[symbol];
-    const totalCost = pricePerShare * quantity;
+    const pricePerShare = await getStockPrice(symbol);
+    if (!pricePerShare) return res.status(500).json({ msg: 'Failed to fetch stock price' });
 
-    // Get user
+    const totalCost = pricePerShare * quantity;
     const user = await User.findById(req.user);
     if (user.balance < totalCost) return res.status(400).json({ msg: 'Insufficient balance' });
 
-    // Deduct balance
     user.balance -= totalCost;
     await user.save();
 
-    // Update portfolio
     let portfolio = await Portfolio.findOne({ userId: req.user });
     if (!portfolio) portfolio = new Portfolio({ userId: req.user, stocks: [] });
 
@@ -79,7 +99,6 @@ router.post('/buy', authMiddleware, async (req, res) => {
 
     await portfolio.save();
 
-    // Create transaction record
     await Transaction.create({
       userId: req.user,
       symbol,
@@ -88,7 +107,10 @@ router.post('/buy', authMiddleware, async (req, res) => {
       type: 'buy'
     });
 
-    res.json({ balance: user.balance, portfolio: portfolio.stocks });
+    res.json({
+      balance: user.balance,
+      portfolio: portfolio.stocks
+    });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }
@@ -97,8 +119,7 @@ router.post('/buy', authMiddleware, async (req, res) => {
 // Sell stock
 router.post('/sell', authMiddleware, async (req, res) => {
   const { symbol, quantity } = req.body;
-  if (!mockStockPrices[symbol]) return res.status(400).json({ msg: 'Invalid stock symbol' });
-  if (quantity <= 0) return res.status(400).json({ msg: 'Quantity must be positive' });
+  if (!symbol || quantity <= 0) return res.status(400).json({ msg: 'Invalid symbol or quantity' });
 
   try {
     const portfolio = await Portfolio.findOne({ userId: req.user });
@@ -108,14 +129,15 @@ router.post('/sell', authMiddleware, async (req, res) => {
     if (stockIndex === -1 || portfolio.stocks[stockIndex].quantity < quantity)
       return res.status(400).json({ msg: 'Not enough shares to sell' });
 
-    const stock = portfolio.stocks[stockIndex];
-    const pricePerShare = mockStockPrices[symbol];
+    const pricePerShare = await getStockPrice(symbol);
+    if (!pricePerShare) return res.status(500).json({ msg: 'Failed to fetch stock price' });
+
     const proceeds = pricePerShare * quantity;
 
-    // Update stock quantity
+    // Update portfolio
+    const stock = portfolio.stocks[stockIndex];
     stock.quantity -= quantity;
     if (stock.quantity === 0) portfolio.stocks.splice(stockIndex, 1);
-
     await portfolio.save();
 
     // Update user balance
@@ -123,7 +145,7 @@ router.post('/sell', authMiddleware, async (req, res) => {
     user.balance += proceeds;
     await user.save();
 
-    // Create transaction record
+    // Create transaction
     await Transaction.create({
       userId: req.user,
       symbol,
@@ -132,7 +154,10 @@ router.post('/sell', authMiddleware, async (req, res) => {
       type: 'sell'
     });
 
-    res.json({ balance: user.balance, portfolio: portfolio.stocks });
+    res.json({
+      balance: user.balance,
+      portfolio: portfolio.stocks
+    });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }
